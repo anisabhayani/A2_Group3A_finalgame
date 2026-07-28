@@ -18,6 +18,12 @@ const PLAYER_H = 64;
 const TRAP_FALL_DELAY = 0.28; // seconds between jump-trigger and collapse
 const TRAP_TRIGGER_RANGE = 300;
 
+// How deep a fallen pit's floor sits below ground level. A normal jump's
+// apex is roughly 128px (JUMP_VELOCITY^2 / (2*GRAVITY)), so keeping this
+// well under that means every pit in the game is climbable — falling in
+// no longer means dying, it just means you have to jump back out.
+const PIT_DEPTH = 100;
+
 let world = null; // the one continuous map (mutable runtime state)
 let checkpoint = { x: 0, y: 0 }; // latest activated mailbox (or the world start)
 let player = null;
@@ -279,7 +285,9 @@ function freshTrapState() {
     armed: t.prefallen || false,
     fallTimer: 0,
     fallen: t.prefallen || false,
-    fallOffset: t.prefallen ? 400 : 0,
+    // Pits settle at PIT_DEPTH, not the old bottomless 400 — see PIT_DEPTH
+    // comment above. This is what makes every pit climbable instead of deadly.
+    fallOffset: t.prefallen ? PIT_DEPTH : 0,
   }));
 }
 
@@ -347,20 +355,22 @@ function respawnPlayer() {
 
 // The old dynamic red-cube hazard from "Stage 1" — kept scoped to that
 // section's stretch of the map, since it was only ever meant to threaten
-// that part of the level. Now spawns DYNAMIC_HAZARD_COUNT of these dogs
-// at once (2, per the "two running total" ask) instead of just one, each
-// teleporting to a new spot on its own independent timer so they don't
-// blink in sync.
-const DYNAMIC_HAZARD_COUNT = 2;
+// that part of the level.
+//
+// Per playtest feedback ("too many dogs" / "too hard for first level"),
+// this now spawns just DYNAMIC_HAZARD_COUNT = 1 dog at a time (was 2),
+// and gives it a wider berth from both the player and the mailbox so a
+// brand-new player has more room to react on their very first stage.
+const DYNAMIC_HAZARD_COUNT = 1;
 
 function initDynamicHazard() {
   const section = WORLD.sections[0];
   const doorForSection = world.mailboxes[0];
   const hw = HAZARD_W;
   const hh = HAZARD_H;
-  const minGapPlayer = 200; // avoid spawning too close to player center
-  const minGapDoor = 180; // avoid spawning too close to mailbox center
-  const minGapOtherHazard = 160; // avoid spawning on top of the other dog
+  const minGapPlayer = 260; // was 200 — more breathing room on first level
+  const minGapDoor = 220; // was 180 — same reasoning near the exit
+  const minGapOtherHazard = 160; // avoid spawning on top of another dog
   const leftBound = section.startX;
   const rightBound = Math.max(section.startX, section.endX - hw);
 
@@ -405,9 +415,10 @@ function initDynamicHazard() {
 
   hazardSpawner = [];
   for (let i = 0; i < DYNAMIC_HAZARD_COUNT; i++) {
-    // Stagger each dog's retimer slightly so the two don't teleport in
-    // lockstep.
-    const intervalMs = 1500 + i * 200;
+    // Slowed down from 1500ms to 2200ms base per "too hard for first
+    // level" feedback — gives the player more time before the dog
+    // relocates, instead of feeling like a rapid-fire gauntlet.
+    const intervalMs = 2200 + i * 200;
     hazardSpawner.push(
       setInterval(() => {
         if (!world || !world.dynamicHazards) return;
@@ -625,6 +636,20 @@ function getGroundSegmentsAt(x) {
     segs.push(...newSegs);
   }
 
+  // Give every fallen pit its own shallow floor, PIT_DEPTH below the
+  // normal ground line. This is the core of the "climb out instead of
+  // dying" fix: the pit is still a real gap you fall into (so it still
+  // reads as a hazard and still requires a jump to escape), but it's no
+  // longer bottomless, so falling in doesn't kill the player.
+  for (const t of world.trapState) {
+    if (!t.fallen) continue;
+    segs.push({
+      left: t.x,
+      right: t.x + t.width,
+      top: world.def.groundY + PIT_DEPTH,
+    });
+  }
+
   if (world.def.blocks && world.def.blocks.length) {
     for (const b of world.def.blocks) {
       segs.push({
@@ -755,7 +780,7 @@ function updateTraps(dt) {
         t.fallen = true;
       }
     }
-    if (t.fallen && t.fallOffset < 400) {
+    if (t.fallen && t.fallOffset < PIT_DEPTH) {
       t.fallOffset += 1400 * dt;
     }
   }
@@ -805,10 +830,11 @@ function updateGapExpansion(dt) {
   const t = world.trapState.find((t) => t.id === "gap-seed");
   if (t) {
     t.width = g.width;
-    // Make sure it's in the fully-fallen state so it renders black and
-    // its ground is subtracted from getGroundSegmentsAt
+    // Make sure it's in the fully-fallen state so it renders as an open
+    // pit and its floor (not a bottomless drop) is subtracted/added in
+    // getGroundSegmentsAt
     t.fallen = true;
-    t.fallOffset = 400;
+    t.fallOffset = PIT_DEPTH;
   }
 }
 
@@ -1003,6 +1029,9 @@ function update(dt) {
   // Each section keeps its own "how far can you fall before you die" rule
   // (e.g. the old Level 5's tall vertical climb needed a much lower limit
   // than the default), chosen by whichever section the player is over.
+  // Note this only ever fires now if the player falls past a pit's own
+  // PIT_DEPTH floor entirely (e.g. off the edge of the world), since every
+  // in-level pit now has a floor to land on.
   const fallLimit = WORLD.sections[getSectionIndexForX(player.x)].fallLimit;
   if (player.y > fallLimit) {
     killPlayer();
@@ -1079,6 +1108,20 @@ function activateCheckpoint(mb) {
 // Render
 // ------------------------------------------------------------
 
+// Draws a soft dark outline behind a hazard sprite so it reads clearly
+// against BG.png's busy artwork (bushes, building textures, etc). This
+// directly addresses the "background interference" playtest note —
+// without this, a dog standing in front of a hedge or the building facade
+// can blend in and be hard to spot in time.
+function drawHazardOutline(x, y, w, h) {
+  ctx.save();
+  ctx.shadowColor = "rgba(0, 0, 0, 0.55)";
+  ctx.shadowBlur = 10;
+  ctx.fillStyle = "rgba(0, 0, 0, 0.001)"; // invisible fill, just casts the shadow
+  ctx.fillRect(x, y, w, h);
+  ctx.restore();
+}
+
 function draw() {
   ctx.clearRect(0, 0, VIEW_W, VIEW_H);
 
@@ -1108,12 +1151,15 @@ function draw() {
 
   for (const t of world.trapState) {
     if (t.fallen) {
-      // falling slab graphic dropping out of view
+      // falling slab settles onto the pit floor instead of dropping forever
       ctx.fillStyle = "tan";
       ctx.fillRect(t.x, world.def.groundY + t.fallOffset, t.width, 14);
-      // pit interior (darker) revealed behind it
+      // shallow pit interior — deep enough to require a jump, never
+      // bottomless. Height capped at PIT_DEPTH instead of the old
+      // VIEW_H-tall black rectangle, so it visually reads as a hole you
+      // can jump out of rather than a void.
       ctx.fillStyle = "#38201F";
-      ctx.fillRect(t.x, world.def.groundY, t.width, VIEW_H);
+      ctx.fillRect(t.x, world.def.groundY, t.width, PIT_DEPTH);
     } else if (t.armed) {
       // subtle pre-collapse tremor cue
       const shake = Math.sin(gameTime * 60) * 2;
@@ -1136,13 +1182,15 @@ function draw() {
 
   // patrolling ground hazards (e.g. Stage 5's hedge dogs) — always
   // visible, always damaging. These use whitedog.png (Stage 5's own
-  // sprite, kept separate from Stage 1's dog.png).
+  // sprite, kept separate from Stage 1's dog.png). Outlined so they
+  // stand out from the background art behind them.
   for (const g of world.groundHazards || []) {
     const gx = g.currentX !== undefined ? g.currentX : g.x;
     const gy = world.def.groundY - g.height;
     const useDog = g.sprite === "dog";
     const img = useDog ? dogImg : whitedogImg;
     const imgReady = useDog ? dogLoaded : whitedogLoaded;
+    drawHazardOutline(gx, gy, g.width, g.height);
     if (imgReady) {
       ctx.drawImage(img, gx, gy, g.width, g.height);
     } else {
@@ -1168,7 +1216,9 @@ function draw() {
   // hazards (box/dog/whitedog tics). Last-stage flashing hazards
   // (`flash: true`) blink on/off — collision in update() now skips them
   // entirely while they're flashed out, so the player can walk straight
-  // through during the "off" phase, not just visually miss them.
+  // through during the "off" phase, not just visually miss them. Each
+  // hazard gets a soft outline first so it reads clearly against BG.png
+  // instead of blending into the artwork ("background interference" fix).
   for (const hz of getAllHazards()) {
     if (hz.flash && !isHazardVisible(hz)) continue;
 
@@ -1185,6 +1235,8 @@ function draw() {
         : hz.sprite === "dog"
           ? dogLoaded
           : boxLoaded;
+
+    drawHazardOutline(hz.x, hzY, hz.width, hz.height);
 
     if (imgReady) {
       ctx.drawImage(img, hz.x, hzY, hz.width, hz.height);
